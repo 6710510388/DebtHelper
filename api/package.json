@@ -8,13 +8,10 @@
     "build": "echo 'No build needed'"
   },
   "dependencies": {
-    "better-sqlite3": "^12.8.0",
+    "mssql": "^11.0.1",
     "cors": "^2.8.5"
   },
   "devDependencies": {
     "@azure/functions": "^4.3.0"
-  },
-  "bundleDependencies": [
-    "better-sqlite3"
-  ]
+  }
 }

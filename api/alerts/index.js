@@ -1,17 +1,19 @@
 /**
- * GET /api/alerts?userId=1           — ดึง alerts ทั้งหมด (พร้อม auto-generate จากหนี้ใกล้ครบ)
- * PUT /api/alerts?id=1               — mark as read
- * PUT /api/alerts?action=readAll&userId=1 — mark all as read
+ * GET /api/alerts?userId=1
+ * PUT /api/alerts?id=1
+ * PUT /api/alerts?action=readAll&userId=1
  */
-const { getDb, ok, fail, setCorsHeaders } = require('../_shared/db');
+const { getPool, ok, fail, setCorsHeaders, sql } = require('../_shared/db');
 
-function generateAlerts(db, userId) {
-  const debts = db.prepare(`SELECT * FROM debts WHERE user_id=? AND status='active'`).all(userId);
+async function generateAlerts(pool, userId) {
+  const debtsResult = await pool.request()
+    .input('userId', sql.Int, userId)
+    .query("SELECT * FROM debts WHERE user_id=@userId AND status='active'");
+  const debts = debtsResult.recordset;
   const today = new Date();
   const todayDay = today.getDate();
 
   for (const d of debts) {
-    // Due soon alert (within 5 days)
     if (d.due_day) {
       const daysUntilDue = d.due_day >= todayDay
         ? d.due_day - todayDay
@@ -23,29 +25,37 @@ function generateAlerts(db, userId) {
           ? `💸 ${d.name} ครบกำหนดชำระวันนี้! ยอด ${d.min_payment.toLocaleString('th-TH')} บาท`
           : `⏰ ${d.name} ครบกำหนดชำระในอีก ${Math.round(daysUntilDue)} วัน (${d.min_payment.toLocaleString('th-TH')} บาท)`;
 
-        const exists = db.prepare(`
-          SELECT id FROM alerts WHERE user_id=? AND debt_id=? AND type=? 
-          AND date(created_at) = date('now')
-        `).get(userId, d.id, type);
+        const exists = await pool.request()
+          .input('uid',    sql.Int,      userId)
+          .input('debtId', sql.Int,      d.id)
+          .input('type',   sql.NVarChar, type)
+          .query(`SELECT id FROM alerts WHERE user_id=@uid AND debt_id=@debtId AND type=@type
+                  AND CAST(created_at AS DATE)=CAST(GETDATE() AS DATE)`);
 
-        if (!exists) {
-          db.prepare(`INSERT INTO alerts (user_id, debt_id, type, message) VALUES (?,?,?,?)`)
-            .run(userId, d.id, type, msg);
+        if (!exists.recordset[0]) {
+          await pool.request()
+            .input('uid',    sql.Int,      userId)
+            .input('debtId', sql.Int,      d.id)
+            .input('type',   sql.NVarChar, type)
+            .input('msg',    sql.NVarChar, msg)
+            .query('INSERT INTO alerts (user_id,debt_id,type,message) VALUES (@uid,@debtId,@type,@msg)');
         }
       }
     }
 
-    // High interest alert (once per week)
     if (d.interest_rate >= 18) {
-      const exists = db.prepare(`
-        SELECT id FROM alerts WHERE user_id=? AND debt_id=? AND type='high_interest'
-        AND created_at >= datetime('now', '-7 days')
-      `).get(userId, d.id);
+      const exists = await pool.request()
+        .input('uid',    sql.Int,      userId)
+        .input('debtId', sql.Int,      d.id)
+        .query(`SELECT id FROM alerts WHERE user_id=@uid AND debt_id=@debtId AND type='high_interest'
+                AND created_at >= DATEADD(day,-7,GETDATE())`);
 
-      if (!exists) {
-        db.prepare(`INSERT INTO alerts (user_id, debt_id, type, message) VALUES (?,?,?,?)`)
-          .run(userId, d.id, 'high_interest',
-            `⚠️ ${d.name} มีดอกเบี้ย ${d.interest_rate}% ต่อปี — พิจารณาปิดก่อน!`);
+      if (!exists.recordset[0]) {
+        await pool.request()
+          .input('uid',    sql.Int,      userId)
+          .input('debtId', sql.Int,      d.id)
+          .input('msg',    sql.NVarChar, `⚠️ ${d.name} มีดอกเบี้ย ${d.interest_rate}% ต่อปี — พิจารณาปิดก่อน!`)
+          .query("INSERT INTO alerts (user_id,debt_id,type,message) VALUES (@uid,@debtId,'high_interest',@msg)");
       }
     }
   }
@@ -59,34 +69,39 @@ module.exports = async function (context, req) {
   }
 
   try {
-    const db = getDb();
+    const pool = await getPool();
     const userId = parseInt(req.query.userId || '1');
     const id = parseInt(req.query.id);
     const action = req.query.action;
 
     if (req.method === 'GET') {
-      // Auto-generate alerts from current debt state
-      generateAlerts(db, userId);
-
-      const alerts = db.prepare(`
-        SELECT a.*, d.name as debt_name FROM alerts a
-        LEFT JOIN debts d ON d.id = a.debt_id
-        WHERE a.user_id = ?
-        ORDER BY a.is_read ASC, a.created_at DESC
-        LIMIT 50
-      `).all(userId);
-
-      return ok(context, alerts);
+      await generateAlerts(pool, userId);
+      const result = await pool.request()
+        .input('userId', sql.Int, userId)
+        .query(`
+          SELECT TOP(50) a.*, d.name as debt_name FROM alerts a
+          LEFT JOIN debts d ON d.id=a.debt_id
+          WHERE a.user_id=@userId
+          ORDER BY a.is_read ASC, a.created_at DESC
+        `);
+      return ok(context, result.recordset);
     }
 
     if (req.method === 'PUT') {
       if (action === 'readAll') {
-        db.prepare(`UPDATE alerts SET is_read=1 WHERE user_id=?`).run(userId);
+        await pool.request()
+          .input('userId', sql.Int, userId)
+          .query('UPDATE alerts SET is_read=1 WHERE user_id=@userId');
         return ok(context, { updated: true });
       }
       if (id) {
-        db.prepare(`UPDATE alerts SET is_read=1 WHERE id=?`).run(id);
-        return ok(context, db.prepare('SELECT * FROM alerts WHERE id=?').get(id));
+        await pool.request()
+          .input('id', sql.Int, id)
+          .query('UPDATE alerts SET is_read=1 WHERE id=@id');
+        const result = await pool.request()
+          .input('id', sql.Int, id)
+          .query('SELECT * FROM alerts WHERE id=@id');
+        return ok(context, result.recordset[0]);
       }
       return fail(context, 'Missing id or action');
     }

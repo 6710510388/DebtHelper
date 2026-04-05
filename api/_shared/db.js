@@ -1,18 +1,26 @@
 /**
- * DebtHelper - Shared DB utility
+ * DebtHelper - Shared DB utility (Azure SQL / mssql)
  */
-const Database = require('better-sqlite3');
-const path = require('path');
+const sql = require('mssql');
 
-let _db = null;
+const config = {
+  server: process.env.DB_SERVER,
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  port: 1433,
+  options: {
+    encrypt: true,
+    trustServerCertificate: false
+  },
+  pool: { max: 10, min: 0, idleTimeoutMillis: 30000 }
+};
 
-function getDb() {
-  if (_db) return _db;
-  const dbPath = path.join(__dirname, '..', '..', 'database', 'debthelper.db');
-  _db = new Database(dbPath);
-  _db.pragma('journal_mode = WAL');
-  _db.pragma('foreign_keys = ON');
-  return _db;
+let pool = null;
+
+async function getPool() {
+  if (!pool) pool = await sql.connect(config);
+  return pool;
 }
 
 function setCorsHeaders(context) {
@@ -37,4 +45,4 @@ function fail(context, message, status = 400) {
   context.res.body = JSON.stringify({ success: false, error: message });
 }
 
-module.exports = { getDb, ok, fail, setCorsHeaders };
+module.exports = { getPool, ok, fail, setCorsHeaders, sql };

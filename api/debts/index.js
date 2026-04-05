@@ -4,7 +4,7 @@
  * PUT    /api/debts?id=1      body: { current_balance, ... }
  * DELETE /api/debts?id=1
  */
-const { getDb, ok, fail, setCorsHeaders } = require('../_shared/db');
+const { getPool, ok, fail, setCorsHeaders, sql } = require('../_shared/db');
 
 module.exports = async function (context, req) {
   if (req.method === 'OPTIONS') {
@@ -14,70 +14,97 @@ module.exports = async function (context, req) {
   }
 
   try {
-    const db = getDb();
+    const pool = await getPool();
     const method = req.method;
     const id = parseInt(req.query.id);
     const userId = parseInt(req.query.userId || '1');
 
+    // --- GET ---
     if (method === 'GET') {
-      const debts = db.prepare(`
-        SELECT d.*,
-          COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.debt_id = d.id), 0) as total_paid
-        FROM debts d
-        WHERE d.user_id = ?
-        ORDER BY d.interest_rate DESC
-      `).all(userId);
-      return ok(context, debts);
+      const result = await pool.request()
+        .input('userId', sql.Int, userId)
+        .query(`
+          SELECT d.*,
+            COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.debt_id = d.id), 0) as total_paid
+          FROM debts d
+          WHERE d.user_id = @userId
+          ORDER BY d.interest_rate DESC
+        `);
+      return ok(context, result.recordset);
     }
 
+    // --- POST ---
     if (method === 'POST') {
       const b = req.body || {};
-      if (!b.name || !b.type || !b.current_balance || !b.interest_rate) {
+      if (!b.name || !b.type || !b.current_balance || !b.interest_rate)
         return fail(context, 'Missing required fields');
-      }
-      const stmt = db.prepare(`
-        INSERT INTO debts
-          (user_id, name, type, term_type, creditor, principal, current_balance, interest_rate, min_payment, due_day, term_months, color, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const result = stmt.run(
-        b.userId || userId,
-        b.name, b.type,
-        b.term_type || 'short',
-        b.creditor || '',
-        b.principal || b.current_balance,
-        b.current_balance,
-        b.interest_rate,
-        b.min_payment || 0,
-        b.due_day || null,
-        b.term_months || null,
-        b.color || '#FF6B6B',
-        b.notes || ''
-      );
-      const newDebt = db.prepare('SELECT * FROM debts WHERE id = ?').get(result.lastInsertRowid);
-      return ok(context, newDebt);
+
+      const inserted = await pool.request()
+        .input('userId',     sql.Int,      b.userId || userId)
+        .input('name',       sql.NVarChar, b.name)
+        .input('type',       sql.NVarChar, b.type)
+        .input('termType',   sql.NVarChar, b.term_type || 'short')
+        .input('creditor',   sql.NVarChar, b.creditor || '')
+        .input('principal',  sql.Float,    b.principal || b.current_balance)
+        .input('balance',    sql.Float,    b.current_balance)
+        .input('rate',       sql.Float,    b.interest_rate)
+        .input('minPay',     sql.Float,    b.min_payment || 0)
+        .input('dueDay',     sql.Int,      b.due_day || null)
+        .input('termMonths', sql.Int,      b.term_months || null)
+        .input('color',      sql.NVarChar, b.color || '#FF6B6B')
+        .input('notes',      sql.NVarChar, b.notes || '')
+        .query(`
+          INSERT INTO debts
+            (user_id, name, type, term_type, creditor, principal, current_balance, interest_rate, min_payment, due_day, term_months, color, notes)
+          OUTPUT INSERTED.id
+          VALUES (@userId, @name, @type, @termType, @creditor, @principal, @balance, @rate, @minPay, @dueDay, @termMonths, @color, @notes)
+        `);
+
+      const newId = inserted.recordset[0].id;
+      const newDebt = await pool.request()
+        .input('id', sql.Int, newId)
+        .query('SELECT * FROM debts WHERE id = @id');
+      return ok(context, newDebt.recordset[0]);
     }
 
+    // --- PUT ---
     if (method === 'PUT') {
       if (!id) return fail(context, 'Missing id');
       const b = req.body || {};
-      const fields = [];
-      const values = [];
       const allowed = ['name','type','term_type','creditor','current_balance','interest_rate','min_payment','due_day','term_months','color','notes','status','priority'];
+      const req2 = pool.request().input('id', sql.Int, id);
+      const fields = [];
+
+      const typeMap = {
+        name: sql.NVarChar, type: sql.NVarChar, term_type: sql.NVarChar,
+        creditor: sql.NVarChar, color: sql.NVarChar, notes: sql.NVarChar, status: sql.NVarChar,
+        current_balance: sql.Float, interest_rate: sql.Float, min_payment: sql.Float,
+        due_day: sql.Int, term_months: sql.Int, priority: sql.Int
+      };
+
       for (const key of allowed) {
-        if (b[key] !== undefined) { fields.push(`${key} = ?`); values.push(b[key]); }
+        if (b[key] !== undefined) {
+          const paramName = key.replace(/_([a-z])/g, g => g[1].toUpperCase());
+          req2.input(paramName, typeMap[key], b[key]);
+          fields.push(`${key} = @${paramName}`);
+        }
       }
       if (!fields.length) return fail(context, 'Nothing to update');
-      fields.push("updated_at = datetime('now')");
-      values.push(id);
-      db.prepare(`UPDATE debts SET ${fields.join(', ')} WHERE id = ?`).run(...values);
-      const updated = db.prepare('SELECT * FROM debts WHERE id = ?').get(id);
-      return ok(context, updated);
+      fields.push('updated_at = GETDATE()');
+
+      await req2.query(`UPDATE debts SET ${fields.join(', ')} WHERE id = @id`);
+      const updated = await pool.request()
+        .input('id', sql.Int, id)
+        .query('SELECT * FROM debts WHERE id = @id');
+      return ok(context, updated.recordset[0]);
     }
 
+    // --- DELETE ---
     if (method === 'DELETE') {
       if (!id) return fail(context, 'Missing id');
-      db.prepare('DELETE FROM debts WHERE id = ?').run(id);
+      await pool.request()
+        .input('id', sql.Int, id)
+        .query('DELETE FROM debts WHERE id = @id');
       return ok(context, { deleted: id });
     }
 
