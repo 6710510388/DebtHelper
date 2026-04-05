@@ -1,0 +1,20 @@
+{
+  "name": "debthelper-api",
+  "version": "1.0.0",
+  "description": "DebtHelper Azure Functions API",
+  "main": "index.js",
+  "scripts": {
+    "start": "func start",
+    "build": "echo 'No build needed'"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "@azure/functions": "^4.3.0"
+  },
+  "bundleDependencies": [
+    "better-sqlite3"
+  ]
+}

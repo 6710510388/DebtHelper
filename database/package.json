@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "better-sqlite3": "^12.8.0"
+  },
+  "bundleDependencies": [
+    "better-sqlite3"
+  ]
+}
